@@ -1,84 +1,90 @@
+import os
 import streamlit as st
-import requests
+from langchain.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain.chat_models import ChatOpenAI
+from pinecone import Pinecone
+from sentence_transformers import SentenceTransformer
+from langchain.chat_models import ChatOpenAI
+
+# Load environment variables (PINECONE_API_KEY, etc.)
+from dotenv import load_dotenv
+load_dotenv()
+
+# Initialize Pinecone
+pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+index = pc.Index(os.getenv("PINECONE_INDEX_NAME"))
+
+# Embedding model (must match the dimension of your Pinecone index)
+embed_model = SentenceTransformer("all-MiniLM-L6-v2")  # 384 dims
+
+# LLM (TinyLLaMA running locally)
+llm = ChatOpenAI(
+    model_name="tinyllama",
+    openai_api_base="http://localhost:1234/v1",
+    openai_api_key="not-needed",
+    temperature=0.5
+)
 
 
+# Prompts
+prompt_direct = ChatPromptTemplate.from_template(
+    "Answer the query directly based on the following retrieved context.\nQuery: {question}\nContext: {context}\nAnswer:"
+)
+
+prompt_hyde = ChatPromptTemplate.from_template(
+    "Generate a concise description of a professional's skills and role based on the query.\nQuery: {question}\nDescription: A professional with the following qualifications:"
+)
+
+# HyDE pipeline to generate query context
+generate_docs_for_retrieval = prompt_hyde | llm | StrOutputParser()
+
+# Query Pinecone
+
+def retrieve_docs(hypothetical_doc, top_k=5):
+    vector = embed_model.encode(hypothetical_doc).tolist()
+    results = index.query(vector=vector, top_k=top_k, include_metadata=True)
+    docs = []
+    for match in results['matches']:
+        docs.append({
+            "id": match['id'],
+            "content": match['metadata'].get('text', ''),
+            "metadata": match['metadata'],
+            "score": match['score']
+        })
+    return docs
+
+# Full pipeline
+def retrieve_and_answer(query):
+    hypothetical_doc = generate_docs_for_retrieval.invoke({"question": query})
+    retrieved_docs = retrieve_docs(hypothetical_doc)
+    context = "\n".join([doc['content'] for doc in retrieved_docs])
+    answer = (prompt_direct | llm | StrOutputParser()).invoke({"question": query, "context": context})
+    return answer, hypothetical_doc, retrieved_docs
+
+# Streamlit UI
 st.set_page_config(page_title="GrantU Chat Assistant", layout="wide")
-
-
-
-def query_local_llm(prompt, system_prompt, model):
-    url = "http://127.0.0.1:1234/v1/chat/completions"
-    headers = {"Content-Type": "application/json"}
-
-    model_map = {
-        "LLaMA 2": "llama-2-7b-chat",
-        "LLaMA 3": "llama-3-8b-chat",
-        "Mistral": "mistral-7b-instruct",
-        "Custom": "tinyllama-1.1b-chat-v1.0"
-    }
-
-    selected_model = model_map.get(model, "tinyllama-1.1b-chat-v1.0")
-
-    data = {
-        "model": selected_model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.7,
-        "max_tokens": 300
-    }
-
-    try:
-        response = requests.post(url, headers=headers, json=data)
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"Error: {e}"
-
-
-system_prompt = """
-You are GrantBot, an education assistant for GrantU.
-
-Help users with:
-- Scholarships (finding, applying, eligibility, tips)
-- Mentorship (how to connect, benefits)
-- Application help (essays, documents)
-
-If asked anything else, kindly guide them back to these topics.
-"""
 
 with st.sidebar:
     st.title("⚙️ Settings")
-    model = st.selectbox("LLM Model", ["LLaMA 2", "LLaMA 3", "Mistral", "Custom"])
+    model = st.selectbox("LLM Model", ["TinyLLaMA", "Custom"])
     st.caption("GrantBot v1.0")
 
-
 st.markdown("<h1 style='font-size: 36px;'>🎓 GrantU Chat Assistant</h1>", unsafe_allow_html=True)
-st.markdown("<p style='font-size: 18px; color: gray;'>Ask about scholarships, mentorship, or application guidance.</p>", unsafe_allow_html=True)
 
+# Suggested Prompts
+preset_prompts = [
+    "List mentors in Molecular Biology with 10+ years experience.",
+    "Share mentors from Meta or Microsoft.",
+    "Tell me 4 mentors with 12+ years in Investment Banking.",
+    "Show mentors in Data Science and ML."
+]
 
-st.markdown("### Featured Mentors")
-
+# Mentor Profiles Display
 mentor_profiles = [
-    {
-        "name": "Aditi Sharma",
-        "role": "Data Scientist, Google",
-        "skills": "Machine Learning, Deep Learning",
-        "photo": "https://randomuser.me/api/portraits/women/44.jpg"
-    },
-    {
-        "name": "Rohan Mehta",
-        "role": "Chef, ITC",
-        "skills": "Knife Skills, Flavor Balancing",
-        "photo": "https://randomuser.me/api/portraits/men/46.jpg"
-    },
-    {
-        "name": "Sneha Patel",
-        "role": "cosmeticsitst, MARS Cosmetics",
-        "skills": "Skin Analysis, Precision Application",
-        "photo": "https://randomuser.me/api/portraits/women/65.jpg"
-    }
+    {"name": "Aditi Sharma", "role": "Data Scientist, Google", "skills": "ML, DL", "photo": "https://randomuser.me/api/portraits/women/44.jpg"},
+    {"name": "Rohan Mehta", "role": "Chef, ITC", "skills": "Knife Skills", "photo": "https://randomuser.me/api/portraits/men/46.jpg"},
+    {"name": "Sneha Patel", "role": "Cosmetologist, MARS", "skills": "Skin Analysis", "photo": "https://randomuser.me/api/portraits/women/65.jpg"}
 ]
 
 cols = st.columns(3)
@@ -90,20 +96,10 @@ for i, mentor in enumerate(mentor_profiles):
         st.markdown(f"*{mentor['skills']}*")
 
 
-preset_prompts = [
-    "List mentors who specialize in Molecular Biology with over 10 years of mentoring experience.",
-    "Share profiles of mentors who’ve worked with Meta or Microsoft.",
-    "Tell me 4 mentors with 12+ years experience in Investment Banking.",
-    "Show me mentors with experience in data science and machine learning for undergraduate students."
-]
-
 cols = st.columns(len(preset_prompts))
 for i, prompt in enumerate(preset_prompts):
     if cols[i].button(prompt):
         st.session_state.suggested_prompt = prompt
-
-
-st.markdown("")
 
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
@@ -116,16 +112,18 @@ suggestion = st.session_state.pop("suggested_prompt", None)
 if suggestion:
     st.chat_message("user").markdown(suggestion)
     st.session_state.chat_history.append({"role": "user", "text": suggestion})
-
-    bot_reply = query_local_llm(suggestion, system_prompt, model)
-    st.chat_message("assistant").markdown(bot_reply)
-    st.session_state.chat_history.append({"role": "assistant", "text": bot_reply})
+    answer, hypo_doc, retrieved = retrieve_and_answer(suggestion)
+    st.chat_message("assistant").markdown(f"**LLM Answer:** {answer}\n\n---\n**Hypothetical Doc:** {hypo_doc}")
+    for doc in retrieved:
+        st.info(f"**{doc['content']}**\n_Matched Metadata_: {doc['metadata']}\n_Score_: {round(doc['score'], 3)}")
+    st.session_state.chat_history.append({"role": "assistant", "text": answer})
 
 user_input = st.chat_input("Ask your question here...")
 if user_input:
     st.chat_message("user").markdown(user_input)
     st.session_state.chat_history.append({"role": "user", "text": user_input})
-
-    response = query_local_llm(user_input, system_prompt, model)
-    st.chat_message("assistant").markdown(response)
-    st.session_state.chat_history.append({"role": "assistant", "text": response})
+    answer, hypo_doc, retrieved = retrieve_and_answer(user_input)
+    st.chat_message("assistant").markdown(f"**LLM Answer:** {answer}\n\n---\n**Hypothetical Doc:** {hypo_doc}")
+    for doc in retrieved:
+        st.info(f"**{doc['content']}**\n_Matched Metadata_: {doc['metadata']}\n_Score_: {round(doc['score'], 3)}")
+    st.session_state.chat_history.append({"role": "assistant", "text": answer})
